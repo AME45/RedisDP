@@ -2,11 +2,15 @@ package com.hmdp.utils;
 
 import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
+import com.hmdp.entity.Shop;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
@@ -30,6 +34,10 @@ public class CacheClient {
         redisData.setData(value);
         redisData.setExpireTime(LocalDateTime.now().plusSeconds(timeUnit.toSeconds(time)));
         stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
+    }
+
+    public void del(String key) {
+        stringRedisTemplate.delete(key);
     }
 
     public  <R,ID>R queryWithPassThrough(
@@ -86,6 +94,74 @@ public class CacheClient {
         // 10.返回
         return r;
     }
+
+    private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
+
+    public <R,ID>R queryWithLogicalExpire(
+            String keyPrefix, ID id, Class<R> type, String mutexKeyPrefix, Function<ID,R> dbFallback, Long expire){
+        // 1.从redis查询缓存
+        String key = keyPrefix + id;
+        String json = stringRedisTemplate.opsForValue().get(key);
+        // 2.判断缓存是否存在
+        if (StrUtil.isBlank(json)) {
+            // 不存在，直接返回
+            return null;
+        }
+        //命中，需要把json反序列化为对象
+        RedisData redisData = JSONUtil.toBean(json, RedisData.class);
+        R r = JSONUtil.toBean((JSONObject) redisData.getData(),type);
+        LocalDateTime expireTime = redisData.getExpireTime();
+        //判断是否过期
+        if(expireTime.isAfter(LocalDateTime.now())) {
+            //未过期，直接返回店铺信息
+            return r;
+        }
+        //过期，进行缓存重建
+        //缓存重建
+        //获取互斥锁
+        String localKey = mutexKeyPrefix + id;
+        boolean isLock = tryLock(localKey);
+        //判断是否获取成功
+        if (isLock) {
+            json = stringRedisTemplate.opsForValue().get(key);
+            // 5.1判断缓存是否存在
+            if (StrUtil.isBlank(json)) {
+                return null;
+            }
+            redisData = JSONUtil.toBean(json, RedisData.class);
+            r = JSONUtil.toBean((JSONObject) redisData.getData(),type);
+            expireTime = redisData.getExpireTime();
+            //判断是否过期
+            if(expireTime.isAfter(LocalDateTime.now())) {
+                //未过期，直接返回店铺信息
+                return r;
+            }
+
+            //成功，开启独立线程，进行缓存重建
+            try {
+                CACHE_REBUILD_EXECUTOR.submit(() -> {
+                    this.saveRedis(keyPrefix,id,expire,dbFallback);});
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            } finally {
+                unlock(localKey);
+            }
+        }
+        // 10.返回
+        return r;
+    }
+
+
+
+    private <R,ID>void saveRedis(String keyPrefix, ID id, Long expireTime, Function<ID,R> dbFallback) {
+        R r = dbFallback.apply(id);
+        RedisData redisData = new RedisData();
+        redisData.setData(r);
+        redisData.setExpireTime(LocalDateTime.now().plusSeconds(expireTime));
+        stringRedisTemplate.opsForValue().set(keyPrefix + id ,JSONUtil.toJsonStr(redisData));
+    }
+
+
 
     private boolean tryLock(String key){
         Boolean b = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", LOCK_SHOP_TTL, TimeUnit.SECONDS);
