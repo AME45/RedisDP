@@ -60,6 +60,5 @@ public class SimpleRedisLock implements ILock{
                 threadId
                 );
 
-        }
     }
 }
